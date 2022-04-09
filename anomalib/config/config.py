@@ -130,10 +130,10 @@ def update_device_config(config: Union[DictConfig, ListConfig], openvino: bool) 
     if not torch.cuda.is_available():
         config.trainer.gpus = 0
 
-    if config.trainer.gpus == 0 and torch.cuda.is_available():
-        config.trainer.gpus = 1
+    #if config.trainer.gpus == 0 and torch.cuda.is_available():
+    #    config.trainer.gpus = 1
 
-    config = update_multi_gpu_training_config(config)
+    #config = update_multi_gpu_training_config(config)
 
     return config
 

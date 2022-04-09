@@ -1,0 +1,20 @@
+name: anomalib‚
+channels:‚
+  - pytorch‚
+  - nvidia
+  - conda-forge
+dependencies:
+  - nvidia::cudatoolkit=11.3
+  - python=3.8
+  - pytorch::pytorch
+  - pytorch::torchvision>=0.5.0
+  - pytorch-lightning 
+  - albumentations 
+  - einops 
+  - omegaconf 
+  - kornia 
+  - wandb 
+  - ipykernel
+  - setuptools==59.5.0
+  - conda-forge::ffmpeg
+  - conda-forge::pillow==6.2.2

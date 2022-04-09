@@ -54,7 +54,7 @@ from pytorch_lightning.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADER
 from torch import Tensor
 from torch.utils.data import DataLoader
 from torch.utils.data.dataset import Dataset
-from torchvision.datasets.folder import VisionDataset
+from torchvision.datasets import VisionDataset
 
 from anomalib.data.inference import InferenceDataset
 from anomalib.data.utils import DownloadProgressBar, read_image
