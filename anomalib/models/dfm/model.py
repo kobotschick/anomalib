@@ -14,16 +14,15 @@
 # See the License for the specific language governing permissions
 # and limitations under the License.
 
-from typing import Dict, List, Union
+from typing import List, Union
 
 import torch
-import torchvision
 from omegaconf import DictConfig, ListConfig
 from torch import Tensor
 
-from anomalib.core.model import AnomalyModule
-from anomalib.core.model.feature_extractor import FeatureExtractor
-from anomalib.models.dfm.dfm_model import DFMModel
+from anomalib.models.components import AnomalyModule
+
+from .dfm_model import DFMModel
 
 
 class DfmLightning(AnomalyModule):
@@ -32,14 +31,13 @@ class DfmLightning(AnomalyModule):
     def __init__(self, hparams: Union[DictConfig, ListConfig]):
         super().__init__(hparams)
 
-        self.backbone = getattr(torchvision.models, hparams.model.backbone)
-        self.feature_extractor = FeatureExtractor(backbone=self.backbone(pretrained=True), layers=["avgpool"]).eval()
-
-        self.dfm_model = DFMModel(n_comps=hparams.model.pca_level, score_type=hparams.model.score_type)
-        self.automatic_optimization = False
+        self.model: DFMModel = DFMModel(
+            backbone=hparams.model.backbone, n_comps=hparams.model.pca_level, score_type=hparams.model.score_type
+        )
+        self.embeddings: List[Tensor] = []
 
     @staticmethod
-    def configure_optimizers() -> None:
+    def configure_optimizers() -> None:  # pylint: disable=arguments-differ
         """DFM doesn't require optimization, therefore returns no optimizers."""
         return None
 
@@ -55,24 +53,21 @@ class DfmLightning(AnomalyModule):
         Returns:
           Deep CNN features.
         """
+        embedding = self.model.get_features(batch["image"]).squeeze()
 
-        self.feature_extractor.eval()
-        layer_outputs = self.feature_extractor(batch["image"])
-        feature_vector = torch.hstack(list(layer_outputs.values())).detach().squeeze()
-        return {"feature_vector": feature_vector}
+        # NOTE: `self.embedding` appends each batch embedding to
+        #   store the training set embedding. We manually append these
+        #   values mainly due to the new order of hooks introduced after PL v1.4.0
+        #   https://github.com/PyTorchLightning/pytorch-lightning/pull/7357
+        self.embeddings.append(embedding)
 
-    def training_epoch_end(self, outputs: List[Dict[str, Tensor]]) -> None:
-        """Fit a KDE model on deep CNN features.
-
-        Args:
-          outputs (List[Dict[str, Tensor]]): Batch of outputs from the training step
-
-        Returns:
-          None
-        """
-
-        feature_stack = torch.vstack([output["feature_vector"] for output in outputs])
-        self.dfm_model.fit(feature_stack)
+    def on_validation_start(self) -> None:
+        """Fit a KDE Model to the embedding collected from the training set."""
+        # NOTE: Previous anomalib versions fit Gaussian at the end of the epoch.
+        #   This is not possible anymore with PyTorch Lightning v1.4.0 since validation
+        #   is run within train epoch.
+        embeddings = torch.vstack(self.embeddings)
+        self.model.fit(embeddings)
 
     def validation_step(self, batch, _):  # pylint: disable=arguments-differ
         """Validation Step of DFM.
@@ -85,10 +80,6 @@ class DfmLightning(AnomalyModule):
         Returns:
           Dictionary containing FRE anomaly scores and ground-truth.
         """
-
-        self.feature_extractor.eval()
-        layer_outputs = self.feature_extractor(batch["image"])
-        feature_vector = torch.hstack(list(layer_outputs.values())).detach()
-        batch["pred_scores"] = self.dfm_model.score(feature_vector.view(feature_vector.shape[:2]))
+        batch["pred_scores"] = self.model(batch["image"])
 
         return batch

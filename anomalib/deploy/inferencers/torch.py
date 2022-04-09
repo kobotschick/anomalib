@@ -23,10 +23,10 @@ import torch
 from omegaconf import DictConfig, ListConfig
 from torch import Tensor
 
-from anomalib.core.model import AnomalyModule
-from anomalib.data.transforms.pre_process import PreProcessor
 from anomalib.deploy.optimize import get_model_metadata
 from anomalib.models import get_model
+from anomalib.models.components import AnomalyModule
+from anomalib.pre_processing import PreProcessor
 
 from .base import Inferencer
 
@@ -138,17 +138,27 @@ class TorchInferencer(Inferencer):
             anomaly_map = predictions
             pred_score = anomaly_map.reshape(-1).max()
         else:
-            anomaly_map, pred_score = predictions
-            pred_score = pred_score.detach().cpu().numpy()
+            # NOTE: Patchcore `forward`` returns heatmap and score.
+            #   We need to add the following check to ensure the variables
+            #   are properly assigned. Without this check, the code
+            #   throws an error regarding type mismatch torch vs np.
+            if isinstance(predictions[1], (Tensor)):
+                anomaly_map, pred_score = predictions
+                pred_score = pred_score.detach()
+            else:
+                anomaly_map, pred_score = predictions
+                pred_score = pred_score.detach().numpy()
 
         anomaly_map = anomaly_map.squeeze()
 
         anomaly_map, pred_score = self._normalize(anomaly_map, pred_score, meta_data)
 
         if isinstance(anomaly_map, Tensor):
-            anomaly_map = anomaly_map.cpu().numpy()
+            anomaly_map = anomaly_map.detach().cpu().numpy()
 
         if "image_shape" in meta_data and anomaly_map.shape != meta_data["image_shape"]:
-            anomaly_map = cv2.resize(anomaly_map, meta_data["image_shape"])
+            image_height = meta_data["image_shape"][0]
+            image_width = meta_data["image_shape"][1]
+            anomaly_map = cv2.resize(anomaly_map, (image_width, image_height))
 
         return anomaly_map, float(pred_score)

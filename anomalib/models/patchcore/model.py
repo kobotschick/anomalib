@@ -26,15 +26,13 @@ from kornia import gaussian_blur2d
 from omegaconf import ListConfig
 from torch import Tensor, nn
 
-from anomalib.core.model import AnomalyModule
-from anomalib.core.model.dynamic_module import DynamicBufferModule
-from anomalib.core.model.feature_extractor import FeatureExtractor
-from anomalib.data.tiler import Tiler
-from anomalib.models.patchcore.utils.sampling import (
+from anomalib.models.components import (
+    AnomalyModule,
+    DynamicBufferModule,
+    FeatureExtractor,
     KCenterGreedy,
-    NearestNeighbors,
-    SparseRandomProjection,
 )
+from anomalib.pre_processing import Tiler
 
 
 class AnomalyMapGenerator:
@@ -44,22 +42,24 @@ class AnomalyMapGenerator:
         self,
         input_size: Union[ListConfig, Tuple],
         sigma: int = 4,
-    ):
+    ) -> None:
         self.input_size = input_size
         self.sigma = sigma
 
-    def compute_anomaly_map(self, patch_scores: torch.Tensor) -> torch.Tensor:
+    def compute_anomaly_map(self, patch_scores: torch.Tensor, feature_map_shape: torch.Size) -> torch.Tensor:
         """Pixel Level Anomaly Heatmap.
 
         Args:
             patch_scores (torch.Tensor): Patch-level anomaly scores
+            feature_map_shape (torch.Size): 2-D feature map shape (width, height)
+
         Returns:
             torch.Tensor: Map of the pixel-level anomaly scores
         """
-        # TODO: https://github.com/openvinotoolkit/anomalib/issues/40
-        batch_size = len(patch_scores) // (28 * 28)
+        width, height = feature_map_shape
+        batch_size = len(patch_scores) // (width * height)
 
-        anomaly_map = patch_scores[:, 0].reshape((batch_size, 1, 28, 28))
+        anomaly_map = patch_scores[:, 0].reshape((batch_size, 1, width, height))
         anomaly_map = F.interpolate(anomaly_map, size=(self.input_size[0], self.input_size[1]))
 
         kernel_size = 2 * int(4.0 * self.sigma + 0.5) + 1
@@ -76,19 +76,21 @@ class AnomalyMapGenerator:
         Returns:
             torch.Tensor: Image-level anomaly scores
         """
-        confidence = patch_scores[torch.argmax(patch_scores[:, 0])]
+        max_scores = torch.argmax(patch_scores[:, 0])
+        confidence = torch.index_select(patch_scores, 0, max_scores)
         weights = 1 - (torch.max(torch.exp(confidence)) / torch.sum(torch.exp(confidence)))
-        score = weights * max(patch_scores[:, 0])
+        score = weights * torch.max(patch_scores[:, 0])
         return score
 
     def __call__(self, **kwargs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns anomaly_map and anomaly_score.
 
         Expects `patch_scores` keyword to be passed explicitly
+        Expects `feature_map_shape` keyword to be passed explicitly
 
         Example
         >>> anomaly_map_generator = AnomalyMapGenerator(input_size=input_size)
-        >>> map, score = anomaly_map_generator(patch_scores=numpy_array)
+        >>> map, score = anomaly_map_generator(patch_scores=numpy_array, feature_map_shape=feature_map_shape)
 
         Raises:
             ValueError: If `patch_scores` key is not found
@@ -100,8 +102,13 @@ class AnomalyMapGenerator:
         if "patch_scores" not in kwargs:
             raise ValueError(f"Expected key `patch_scores`. Found {kwargs.keys()}")
 
+        if "feature_map_shape" not in kwargs:
+            raise ValueError(f"Expected key `feature_map_shape`. Found {kwargs.keys()}")
+
         patch_scores = kwargs["patch_scores"]
-        anomaly_map = self.compute_anomaly_map(patch_scores)
+        feature_map_shape = kwargs["feature_map_shape"]
+
+        anomaly_map = self.compute_anomaly_map(patch_scores, feature_map_shape)
         anomaly_score = self.compute_anomaly_score(patch_scores)
         return anomaly_map, anomaly_score
 
@@ -117,7 +124,7 @@ class PatchcoreModel(DynamicBufferModule, nn.Module):
         apply_tiling: bool = False,
         tile_size: Optional[Tuple[int, int]] = None,
         tile_stride: Optional[int] = None,
-    ):
+    ) -> None:
         super().__init__()
 
         self.backbone = getattr(torchvision.models, backbone)
@@ -127,7 +134,6 @@ class PatchcoreModel(DynamicBufferModule, nn.Module):
 
         self.feature_extractor = FeatureExtractor(backbone=self.backbone(pretrained=True), layers=self.layers)
         self.feature_pooler = torch.nn.AvgPool2d(3, 1, 1)
-        self.nn_search = NearestNeighbors(n_neighbors=9)
         self.anomaly_map_generator = AnomalyMapGenerator(input_size=input_size)
 
         if apply_tiling:
@@ -165,14 +171,16 @@ class PatchcoreModel(DynamicBufferModule, nn.Module):
         if self.apply_tiling:
             embedding = self.tiler.untile(embedding)
 
+        feature_map_shape = embedding.shape[-2:]
         embedding = self.reshape_embedding(embedding)
 
         if self.training:
             output = embedding
         else:
-            patch_scores, _ = self.nn_search.kneighbors(embedding)
-
-            anomaly_map, anomaly_score = self.anomaly_map_generator(patch_scores=patch_scores)
+            patch_scores = self.nearest_neighbors(embedding=embedding, n_neighbors=9)
+            anomaly_map, anomaly_score = self.anomaly_map_generator(
+                patch_scores=patch_scores, feature_map_shape=feature_map_shape
+            )
             output = (anomaly_map, anomaly_score)
 
         return output
@@ -213,25 +221,35 @@ class PatchcoreModel(DynamicBufferModule, nn.Module):
         embedding = embedding.permute(0, 2, 3, 1).reshape(-1, embedding_size)
         return embedding
 
-    @staticmethod
-    def subsample_embedding(embedding: torch.Tensor, sampling_ratio: float) -> torch.Tensor:
-        """Subsample embedding based on coreset sampling.
+    def subsample_embedding(self, embedding: torch.Tensor, sampling_ratio: float) -> None:
+        """Subsample embedding based on coreset sampling and store to memory.
 
         Args:
             embedding (np.ndarray): Embedding tensor from the CNN
             sampling_ratio (float): Coreset sampling ratio
-
-        Returns:
-            np.ndarray: Subsampled embedding whose dimensionality is reduced.
         """
-        # Random projection
-        random_projector = SparseRandomProjection(eps=0.9)
-        random_projector.fit(embedding)
 
         # Coreset Subsampling
-        sampler = KCenterGreedy(model=random_projector, embedding=embedding, sampling_ratio=sampling_ratio)
+        print("Creating CoreSet Sampler via k-Center Greedy")
+        sampler = KCenterGreedy(embedding=embedding, sampling_ratio=sampling_ratio)
+        print("Getting the coreset from the main embedding.")
         coreset = sampler.sample_coreset()
-        return coreset
+        print("Assigning the coreset as the memory bank.")
+        self.memory_bank = coreset
+
+    def nearest_neighbors(self, embedding: Tensor, n_neighbors: int = 9) -> Tensor:
+        """Nearest Neighbours using brute force method and euclidean norm.
+
+        Args:
+            embedding (Tensor): Features to compare the distance with the memory bank.
+            n_neighbors (int): Number of neighbors to look at
+
+        Returns:
+            Tensor: Patch scores.
+        """
+        distances = torch.cdist(embedding, self.memory_bank, p=2.0)  # euclidean norm
+        patch_scores, _ = distances.topk(k=n_neighbors, largest=False, dim=1)
+        return patch_scores
 
 
 class PatchcoreLightning(AnomalyModule):
@@ -246,10 +264,10 @@ class PatchcoreLightning(AnomalyModule):
         apply_tiling (bool, optional): Apply tiling. Defaults to False.
     """
 
-    def __init__(self, hparams):
+    def __init__(self, hparams) -> None:
         super().__init__(hparams)
 
-        self.model = PatchcoreModel(
+        self.model: PatchcoreModel = PatchcoreModel(
             layers=hparams.model.layers,
             input_size=hparams.model.input_size,
             tile_size=hparams.dataset.tiling.tile_size,
@@ -257,9 +275,9 @@ class PatchcoreLightning(AnomalyModule):
             backbone=hparams.model.backbone,
             apply_tiling=hparams.dataset.tiling.apply,
         )
-        self.automatic_optimization = False
+        self.embeddings: List[Tensor] = []
 
-    def configure_optimizers(self):
+    def configure_optimizers(self) -> None:
         """Configure optimizers.
 
         Returns:
@@ -267,13 +285,12 @@ class PatchcoreLightning(AnomalyModule):
         """
         return None
 
-    def training_step(self, batch, _):  # pylint: disable=arguments-differ
+    def training_step(self, batch, _batch_idx):  # pylint: disable=arguments-differ
         """Generate feature embedding of the batch.
 
         Args:
-            batch (Dict[str, Any]): Batch containing image filename,
-                                    image, label and mask
-            _ (int): Batch Index
+            batch (Dict[str, Any]): Batch containing image filename, image, label and mask
+            _batch_idx (int): Batch Index
 
         Returns:
             Dict[str, np.ndarray]: Embedding Vector
@@ -281,23 +298,22 @@ class PatchcoreLightning(AnomalyModule):
         self.model.feature_extractor.eval()
         embedding = self.model(batch["image"])
 
-        return {"embedding": embedding}
+        # NOTE: `self.embedding` appends each batch embedding to
+        #   store the training set embedding. We manually append these
+        #   values mainly due to the new order of hooks introduced after PL v1.4.0
+        #   https://github.com/PyTorchLightning/pytorch-lightning/pull/7357
+        self.embeddings.append(embedding)
 
-    def training_epoch_end(self, outputs):
-        """Concatenate batch embeddings to generate normal embedding.
+    def on_validation_start(self) -> None:
+        """Apply subsampling to the embedding collected from the training set."""
+        # NOTE: Previous anomalib versions fit subsampling at the end of the epoch.
+        #   This is not possible anymore with PyTorch Lightning v1.4.0 since validation
+        #   is run within train epoch.
+        print("Aggregating the embedding extracted from the training set.")
+        embeddings = torch.vstack(self.embeddings)
 
-        Apply coreset subsampling to the embedding set for dimensionality reduction.
-
-        Args:
-            outputs (List[Dict[str, np.ndarray]]): List of embedding vectors
-        """
-        embedding = torch.vstack([output["embedding"] for output in outputs])
         sampling_ratio = self.hparams.model.coreset_sampling_ratio
-
-        embedding = self.model.subsample_embedding(embedding, sampling_ratio)
-
-        self.model.nn_search.fit(embedding)
-        self.model.memory_bank = embedding
+        self.model.subsample_embedding(embeddings, sampling_ratio)
 
     def validation_step(self, batch, _):  # pylint: disable=arguments-differ
         """Get batch of anomaly maps from input image batch.
@@ -311,7 +327,8 @@ class PatchcoreLightning(AnomalyModule):
             Dict[str, Any]: Image filenames, test images, GT and predicted label/masks
         """
 
-        anomaly_maps, _ = self.model(batch["image"])
+        anomaly_maps, anomaly_score = self.model(batch["image"])
         batch["anomaly_maps"] = anomaly_maps
+        batch["pred_scores"] = anomaly_score.unsqueeze(0)
 
         return batch

@@ -21,7 +21,11 @@ from typing import List, Union
 from omegaconf import DictConfig, ListConfig
 from torch import load
 
-from anomalib.core.model import AnomalyModule
+from anomalib.models.components import AnomalyModule
+
+# TODO(AlexanderDokuchaev): Workaround of wrapping by NNCF.
+#                           Can't not wrap `spatial_softmax2d` if use import_module.
+from anomalib.models.padim.model import PadimLightning  # noqa: F401
 
 
 def get_model(config: Union[DictConfig, ListConfig]) -> AnomalyModule:
@@ -47,7 +51,7 @@ def get_model(config: Union[DictConfig, ListConfig]) -> AnomalyModule:
         AnomalyModule: Anomaly Model
     """
     openvino_model_list: List[str] = ["stfpm"]
-    torch_model_list: List[str] = ["padim", "stfpm", "dfkde", "dfm", "patchcore", "cflow", "fastflow"]
+    torch_model_list: List[str] = ["padim", "stfpm", "dfkde", "dfm", "patchcore", "cflow", "ganomaly", "fastflow"]
     model: AnomalyModule
 
     if config.openvino:
